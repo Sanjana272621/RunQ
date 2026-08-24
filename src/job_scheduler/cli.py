@@ -170,6 +170,51 @@ def handle_status(args: argparse.Namespace) -> int:
 
     return 0
 
+def read_log_file(path_value: str | None) -> str:
+    if path_value is None:
+        return "Log file has not been created."
+
+    path = Path(path_value)
+
+    if not path.exists():
+        return f"Log file does not exist: {path}"
+
+    return path.read_text(
+        encoding="utf-8",
+        errors="replace",
+    )
+
+
+def handle_logs(args: argparse.Namespace) -> int:
+    connection = connect_database(args.db)
+
+    try:
+        initialize_schema(connection)
+        job = get_job(
+            connection=connection,
+            job_id=args.job_id,
+        )
+    finally:
+        connection.close()
+
+    if args.stream in {"stdout", "both"}:
+        print("===== STDOUT =====")
+        print(
+            read_log_file(job.stdout_path),
+            end="",
+        )
+
+        if args.stream == "both":
+            print()
+
+    if args.stream in {"stderr", "both"}:
+        print("===== STDERR =====")
+        print(
+            read_log_file(job.stderr_path),
+            end="",
+        )
+
+    return 0
 
 def handle_run(args: argparse.Namespace) -> int:
     if args.workers != 1:
@@ -275,7 +320,29 @@ def create_parser() -> argparse.ArgumentParser:
     )
     status_parser.set_defaults(handler=handle_status)
 
-    # This block defines the missing run subcommand.
+    logs_parser = subparsers.add_parser(
+        "logs",
+        help="Display stdout and stderr for a job",
+    )
+    logs_parser.add_argument(
+        "job_id",
+        type=int,
+        help="Job ID",
+    )
+    logs_parser.add_argument(
+        "--stream",
+        choices=[
+            "stdout",
+            "stderr",
+            "both",
+        ],
+        default="both",
+        help="Which output stream to display",
+    )
+    logs_parser.set_defaults(
+        handler=handle_logs
+    )
+    
     run_parser = subparsers.add_parser(
         "run",
         help="Run the scheduler",
