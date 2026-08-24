@@ -1,97 +1,101 @@
-import os
-import socket
-import time
+import sqlite3
+import subprocess
 from pathlib import Path
 
 from job_scheduler.database import (
-    claim_next_job,
-    connect_database,
-    initialize_schema,
+    finish_job,
+    mark_job_cancelled,
+    record_process_started,
 )
-from job_scheduler.worker import execute_claimed_job
+from job_scheduler.models import Job
 
 
-def create_worker_id() -> str:
-    """Create a readable identifier for this worker."""
-    hostname = socket.gethostname()
-    process_id = os.getpid()
-
-    return (
-        f"{hostname}:"
-        f"{process_id}:"
-        "worker-1"
-    )
-
-
-def run_scheduler(
-    database_path: Path,
+def execute_claimed_job(
+    connection: sqlite3.Connection,
+    job: Job,
+    worker_id: str,
     logs_directory: Path,
-    run_once: bool = False,
-    poll_interval: float = 0.5,
-    retry_base_delay: float = 2.0,
-) -> int:
+    retry_base_delay: float,
+) -> Job:
     """
-    Run a single scheduler worker.
+    Execute one job that has already been claimed by the scheduler.
 
-    With run_once=True, claim at most one job and exit.
-
-    With run_once=False, keep polling until Ctrl+C.
+    The command's stdout and stderr are written to separate log files.
+    The final job state is then stored in SQLite.
     """
-    worker_id = create_worker_id()
-
-    connection = connect_database(
-        database_path
+    logs_directory.mkdir(
+        parents=True,
+        exist_ok=True,
     )
 
-    initialize_schema(connection)
+    stdout_path = logs_directory / (
+        f"job-{job.id}-attempt-{job.attempts}.out"
+    )
 
-    print(
-        f"Scheduler started with worker "
-        f"{worker_id}"
+    stderr_path = logs_directory / (
+        f"job-{job.id}-attempt-{job.attempts}.err"
     )
 
     try:
-        while True:
-            job = claim_next_job(
+        with stdout_path.open("wb") as stdout_file, (
+            stderr_path.open("wb")
+        ) as stderr_file:
+            process = subprocess.Popen(
+                job.command,
+                shell=True,
+                executable="/bin/bash",
+                stdout=stdout_file,
+                stderr=stderr_file,
+            )
+
+            record_process_started(
                 connection=connection,
+                job_id=job.id,
                 worker_id=worker_id,
+                pid=process.pid,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
             )
 
-            if job is None:
-                if run_once:
-                    print("No runnable jobs.")
-                    return 0
+            try:
+                exit_code = process.wait()
+            except KeyboardInterrupt:
+                process.terminate()
 
-                time.sleep(poll_interval)
-                continue
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
 
-            print(
-                f"Claimed job {job.id}: "
-                f"attempt "
-                f"{job.attempts}/"
-                f"{job.max_attempts}"
-            )
+                mark_job_cancelled(
+                    connection=connection,
+                    job_id=job.id,
+                )
 
-            result = execute_claimed_job(
-                connection=connection,
-                job=job,
-                worker_id=worker_id,
-                logs_directory=logs_directory,
-                retry_base_delay=(
-                    retry_base_delay
-                ),
-            )
+                raise
 
-            print(
-                f"Job {result.id} "
-                f"finished attempt "
-                f"{result.attempts} "
-                f"with state "
-                f"{result.state.value}"
-            )
+    except OSError as error:
+        return finish_job(
+            connection=connection,
+            job_id=job.id,
+            exit_code=None,
+            retry_base_delay=retry_base_delay,
+            error_message=str(error),
+        )
 
-            if run_once:
-                return 0
+    error_message = None
 
-    finally:
-        connection.close()
+    if exit_code != 0:
+        error_message = (
+            f"Command exited with code {exit_code}. "
+            f"See stderr log: {stderr_path}"
+        )
+
+    return finish_job(
+        connection=connection,
+        job_id=job.id,
+        exit_code=exit_code,
+        retry_base_delay=retry_base_delay,
+        error_message=error_message,
+    )
