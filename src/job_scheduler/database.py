@@ -63,6 +63,7 @@ ON jobs (
 
 class JobNotFoundError(Exception):
     #Raised when a requested job does not exist
+    pass
 
 
 def connect_database(database_path: Path) -> sqlite3.Connection:
