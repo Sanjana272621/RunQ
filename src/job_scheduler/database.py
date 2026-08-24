@@ -224,3 +224,235 @@ def list_jobs(
         ).fetchall()
 
     return [row_to_job(row) for row in rows]
+
+def claim_next_job(
+    connection: sqlite3.Connection,
+    worker_id: str,
+) -> Job | None:
+    """
+    Atomically claim the highest-priority runnable job.
+
+    Returns None when no job is currently available.
+    """
+    current_time = time.time()
+
+    row = connection.execute(
+        """
+        UPDATE jobs
+        SET
+            state = 'RUNNING',
+            attempts = attempts + 1,
+            worker_id = ?,
+            started_at = ?,
+            finished_at = NULL,
+            updated_at = ?,
+            pid = NULL,
+            exit_code = NULL,
+            last_error = NULL
+        WHERE id = (
+            SELECT id
+            FROM jobs
+            WHERE state IN ('PENDING', 'RETRY_WAIT')
+              AND available_at <= ?
+              AND cancel_requested = 0
+            ORDER BY
+                priority DESC,
+                available_at ASC,
+                created_at ASC
+            LIMIT 1
+        )
+        RETURNING *
+        """,
+        (
+            worker_id,
+            current_time,
+            current_time,
+            current_time,
+        ),
+    ).fetchone()
+
+    connection.commit()
+
+    if row is None:
+        return None
+
+    return row_to_job(row)
+
+def record_process_started(
+    connection: sqlite3.Connection,
+    job_id: int,
+    worker_id: str,
+    pid: int,
+    stdout_path: Path,
+    stderr_path: Path,
+) -> Job:
+    """Store the subprocess PID and log paths."""
+    current_time = time.time()
+
+    cursor = connection.execute(
+        """
+        UPDATE jobs
+        SET
+            pid = ?,
+            stdout_path = ?,
+            stderr_path = ?,
+            updated_at = ?
+        WHERE id = ?
+          AND state = 'RUNNING'
+          AND worker_id = ?
+        """,
+        (
+            pid,
+            str(stdout_path),
+            str(stderr_path),
+            current_time,
+            job_id,
+            worker_id,
+        ),
+    )
+
+    connection.commit()
+
+    if cursor.rowcount != 1:
+        raise RuntimeError(
+            f"Could not record process information for job {job_id}"
+        )
+
+    return get_job(connection, job_id)
+
+def finish_job(
+    connection: sqlite3.Connection,
+    job_id: int,
+    exit_code: int | None,
+    retry_base_delay: float,
+    error_message: str | None = None,
+) -> Job:
+    """Update a running job after its subprocess finishes."""
+    job = get_job(connection, job_id)
+
+    if job.state != JobState.RUNNING:
+        raise ValueError(
+            f"Cannot finish job {job_id} "
+            f"because it is {job.state.value}"
+        )
+
+    current_time = time.time()
+
+    if exit_code == 0:
+        connection.execute(
+            """
+            UPDATE jobs
+            SET
+                state = 'SUCCESS',
+                exit_code = 0,
+                finished_at = ?,
+                updated_at = ?,
+                pid = NULL,
+                lease_expires_at = NULL,
+                last_error = NULL
+            WHERE id = ?
+              AND state = 'RUNNING'
+            """,
+            (
+                current_time,
+                current_time,
+                job_id,
+            ),
+        )
+
+        connection.commit()
+        return get_job(connection, job_id)
+
+    if error_message is None:
+        error_message = f"Process exited with code {exit_code}"
+
+    if job.attempts < job.max_attempts:
+        retry_delay = retry_base_delay * (
+            2 ** (job.attempts - 1)
+        )
+
+        next_available_time = current_time + retry_delay
+
+        connection.execute(
+            """
+            UPDATE jobs
+            SET
+                state = 'RETRY_WAIT',
+                available_at = ?,
+                exit_code = ?,
+                updated_at = ?,
+                worker_id = NULL,
+                pid = NULL,
+                lease_expires_at = NULL,
+                last_error = ?
+            WHERE id = ?
+              AND state = 'RUNNING'
+            """,
+            (
+                next_available_time,
+                exit_code,
+                current_time,
+                error_message,
+                job_id,
+            ),
+        )
+    else:
+        connection.execute(
+            """
+            UPDATE jobs
+            SET
+                state = 'DEAD',
+                exit_code = ?,
+                finished_at = ?,
+                updated_at = ?,
+                pid = NULL,
+                lease_expires_at = NULL,
+                last_error = ?
+            WHERE id = ?
+              AND state = 'RUNNING'
+            """,
+            (
+                exit_code,
+                current_time,
+                current_time,
+                error_message,
+                job_id,
+            ),
+        )
+
+    connection.commit()
+    return get_job(connection, job_id)
+
+def mark_job_cancelled(
+    connection: sqlite3.Connection,
+    job_id: int,
+    error_message: str = "Scheduler interrupted",
+) -> Job:
+    """Mark a running job as cancelled."""
+    current_time = time.time()
+
+    connection.execute(
+        """
+        UPDATE jobs
+        SET
+            state = 'CANCELLED',
+            finished_at = ?,
+            updated_at = ?,
+            pid = NULL,
+            lease_expires_at = NULL,
+            cancel_requested = 1,
+            last_error = ?
+        WHERE id = ?
+          AND state = 'RUNNING'
+        """,
+        (
+            current_time,
+            current_time,
+            error_message,
+            job_id,
+        ),
+    )
+
+    connection.commit()
+    return get_job(connection, job_id)
+

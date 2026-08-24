@@ -22,6 +22,13 @@ DEFAULT_DATABASE_PATH = Path(
     )
 )
 
+DEFAULT_LOGS_DIRECTORY = Path(
+    os.environ.get(
+        "JOBSCHED_LOGS_DIR",
+        "var/logs",
+    )
+)
+
 
 def format_timestamp(timestamp: float | None) -> str:
     if timestamp is None:
@@ -35,7 +42,10 @@ def format_timestamp(timestamp: float | None) -> str:
     return value.strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
-def shorten_command(command: str, maximum_length: int = 45) -> str:
+def shorten_command(
+    command: str,
+    maximum_length: int = 45,
+) -> str:
     if len(command) <= maximum_length:
         return command
 
@@ -149,11 +159,45 @@ def handle_status(args: argparse.Namespace) -> int:
     print(f"Finished at: {format_timestamp(job.finished_at)}")
     print(f"Worker ID: {job.worker_id or '-'}")
     print(f"PID: {job.pid if job.pid is not None else '-'}")
-    print(f"Exit code: {job.exit_code if job.exit_code is not None else '-'}")
+    print(
+        "Exit code: "
+        f"{job.exit_code if job.exit_code is not None else '-'}"
+    )
     print(f"Cancel requested: {job.cancel_requested}")
+    print(f"Standard output: {job.stdout_path or '-'}")
+    print(f"Standard error: {job.stderr_path or '-'}")
     print(f"Last error: {job.last_error or '-'}")
 
     return 0
+
+
+def handle_run(args: argparse.Namespace) -> int:
+    if args.workers != 1:
+        raise ValueError(
+            "The current version supports exactly one worker"
+        )
+
+    if args.poll_interval <= 0:
+        raise ValueError(
+            "poll_interval must be greater than zero"
+        )
+
+    if args.retry_base_delay < 0:
+        raise ValueError(
+            "retry_base_delay cannot be negative"
+        )
+
+    # Imported here so that init/add/list/status continue working
+    # while the worker and scheduler are being developed.
+    from job_scheduler.scheduler import run_scheduler
+
+    return run_scheduler(
+        database_path=args.db,
+        logs_directory=args.logs_dir,
+        run_once=args.once,
+        poll_interval=args.poll_interval,
+        retry_base_delay=args.retry_base_delay,
+    )
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -187,13 +231,13 @@ def create_parser() -> argparse.ArgumentParser:
     add_parser.add_argument(
         "--command",
         required=True,
-        help="Shell command that the job should execute",
+        help="Shell command to execute",
     )
     add_parser.add_argument(
         "--priority",
         type=int,
         default=0,
-        help="Job priority; higher values run first",
+        help="Job priority; higher numbers execute first",
     )
     add_parser.add_argument(
         "--max-attempts",
@@ -231,6 +275,42 @@ def create_parser() -> argparse.ArgumentParser:
     )
     status_parser.set_defaults(handler=handle_status)
 
+    # This block defines the missing run subcommand.
+    run_parser = subparsers.add_parser(
+        "run",
+        help="Run the scheduler",
+    )
+    run_parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of workers; currently only 1 is supported",
+    )
+    run_parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Execute at most one runnable job and exit",
+    )
+    run_parser.add_argument(
+        "--poll-interval",
+        type=float,
+        default=0.5,
+        help="Seconds between checks for runnable jobs",
+    )
+    run_parser.add_argument(
+        "--retry-base-delay",
+        type=float,
+        default=2.0,
+        help="Base delay in seconds for exponential retries",
+    )
+    run_parser.add_argument(
+        "--logs-dir",
+        type=Path,
+        default=DEFAULT_LOGS_DIRECTORY,
+        help="Directory for stdout and stderr logs",
+    )
+    run_parser.set_defaults(handler=handle_run)
+
     return parser
 
 
@@ -247,7 +327,7 @@ def main() -> None:
         print(f"Error: {error}", file=sys.stderr)
         exit_code = 2
     except KeyboardInterrupt:
-        print("\nInterrupted.", file=sys.stderr)
+        print("\nScheduler stopped.", file=sys.stderr)
         exit_code = 130
 
     raise SystemExit(exit_code)
